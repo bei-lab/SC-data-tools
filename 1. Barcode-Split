@@ -1,0 +1,139 @@
+import sys
+import os
+import time
+import logging
+import itertools
+from collections import defaultdict
+from multiprocessing import Pool, set_start_method
+
+bam = sys.argv[1]
+out_dir = sys.argv[2]
+tag_list = sys.argv[3]
+
+nt = 32
+tag = 'CB'  # default TAG is CB
+tag_type = 'Z'  # TAG type is string
+
+samtools = rf'/data/home/lingw/bin/bin/samtools'
+bgzip = rf'/data/home/lingw/bin/bin/bgzip'
+mawk = '/data/home/lingw/anaconda3/bin/mawk'
+tabix = '/data/home/lingw/bin/bin/tabix'
+tools = [samtools, bgzip, mawk, tabix]
+
+
+class SplitBAMErr(Exception):
+    pass
+
+
+def pairwise(iterable):  # ABCD -> (A, B), (B, C), (C, D)
+    a, b = itertools.tee(iterable)
+    next(b, None)
+    return zip(a, b)
+
+
+def get_tag_chunk(chunk_file):
+    barcode_size = []
+    with os.popen(f'{tabix} -l {chunk_file}') as h1:
+        tokens = [i.strip() for i in h1]
+    for i in tokens:
+        with os.popen(f'{tabix} {chunk_file} {i}') as h1:
+            barcode_size.append([i, sum(int(line.split()[-1]) for line in h1)])
+    return barcode_size
+
+
+def dedup(items):  # drop the duplicated value in iterable, while keeping order
+    see = set()
+    for i in items:
+        if i not in see:
+            yield i
+            see.add(i)
+
+
+if __name__ == '__main__':
+    set_start_method('spawn')
+    
+    start_time = time.monotonic()
+    logging.basicConfig(format='%(message)s', level=logging.INFO)
+    
+    if any(not os.path.exists(i) for i in tools):
+        raise SplitBAMErr('samtools, bgzip, mawk and tabix was required.')
+    
+    with open(tag_list) as f:
+        tag_values = [i.strip() for i in f]
+        if 'header' in tag_values:
+            raise SplitBAMErr('Barcode list contain "header" as values.')
+        if len({len(i) for i in tag_values}) != 1:
+            raise SplitBAMErr('Barcode values have different length.')
+        tag_len = len(tag_values[0])
+    
+    # sort bam by TAG and bgzip and index
+    sort_cmd = rf'''mkdir -p {out_dir}
+        {samtools} view -h -@ {nt} --tag-file {tag}:{tag_list} {bam} | \
+        {samtools} sort -@ {nt} -t {tag} -O SAM -T {out_dir}/sub-set - | \
+        {bgzip} -@ {nt} -i -I {out_dir}/sub-set.sam.gz.gzi > {out_dir}/sub-set.sam.gz'''
+    os.system(sort_cmd)
+    
+    if not os.path.exists(f'{out_dir}/sub-set.sam.gz.gzi'):
+        raise SplitBAMErr('Fail to index the sorted SAM file.')
+    
+    # chunk the sorted SAM file, ensure all chunk end with '\n'
+    chunk_size = 1000000000  # step size
+    break_pos = 0
+    break_pos_list = [break_pos]
+    while True:
+        break_pos += chunk_size
+        with os.popen(f'bgzip -b {break_pos} {out_dir}/sub-set.sam.gz | head -1 ') as f:
+            try:
+                extend = [len(i) for i in f][0]  # when out of file end, meet IndexError
+                break_pos += extend
+                break_pos_list.append(break_pos)
+            except IndexError:
+                break
+    break_pos_list.append(break_pos)  # add the last position
+    break_pos_list = [(a1, a2 - a1) for a1, a2 in pairwise(break_pos_list)]  # start, size
+    
+    # index each chunk with multiple threads
+    pre_len = len(f'{tag}:{tag_type}:') + 1
+    index_cmd = [rf'''{bgzip} -b {start} -s {size} {out_dir}/sub-set.sam.gz | \
+        {mawk} '/^@/{{print "header\t"NR"\t"length+1; next}}
+        $11~/^{tag}:{tag_type}:/{{str="";
+            for(i=12; i<=NF; i++) str=str"\t"$i;
+            a=index(str, "\t{tag}:{tag_type}:");
+            b=substr(str, a+{pre_len}, {tag_len});
+            print b"\t"see[b]++"\t"length+1;
+            next}}
+        {{a=index($0,"\t{tag}:{tag_type}:");
+            b=substr($0, a+{pre_len}, {tag_len});
+            print b"\t"see[b]++"\t"length+1}}' | \
+        {bgzip}  > {out_dir}/sub-set-{num}.sam.tag.gz
+        {tabix} -s1 -b2 -e2 -C {out_dir}/sub-set-{num}.sam.tag.gz
+        {tabix} -l {out_dir}/sub-set-{num}.sam.tag.gz > {out_dir}/sub-set-{num}.sam.tag.gz.id'''
+                 for num, (start, size) in enumerate(break_pos_list)]
+    chunk_index = [f'{out_dir}/sub-set-{num}.sam.tag.gz' for num, _ in enumerate(break_pos_list)]
+    
+    with Pool(nt) as p:
+        p.map(os.system, index_cmd)  # index with multiple threads
+        if any(not os.path.exists(f'{i}.csi') for i in chunk_index):
+            raise SplitBAMErr('Barcode ID blocks not continuous.')
+        
+        chunk_tag = []
+        for i in chunk_index:
+            with open(f'{i}.id') as f:
+                chunk_tag.append([i.strip() for i in f])
+        chunk_tag = list(dedup(itertools.chain.from_iterable(chunk_tag)))
+        
+        final_index = defaultdict(int)
+        for key, val in itertools.chain.from_iterable(p.map(get_tag_chunk, chunk_index)):
+            final_index[key] += val
+        final_index = [(key, final_index[key]) for key in chunk_tag]
+        final_index = [(a, b, c) for (a, b), c in zip(final_index, itertools.accumulate(i[-1] for i in final_index))]
+        final_index = [(row2[0], row1[-1], row2[1]) for row1, row2 in pairwise(final_index)]  # barcode, start, length
+        
+        header = f'{out_dir}/sub-set.header'
+        os.system(f'{samtools} view -H {out_dir}/sub-set.sam.gz > {header}')
+        cmds = [rf'''{bgzip} -b {t1} -s {t2} {out_dir}/sub-set.sam.gz | cat {header} - | \
+                {samtools} view --write-index -o {out_dir}/{cell}.sort.bam''' for cell, t1, t2 in final_index]
+        p.map(os.system, cmds, chunksize=10)
+        os.system(f'rm {header}')
+    
+    logging.info(f'Split {len(chunk_tag) - 1} barcodes ({out_dir}) take: {round(time.monotonic() - start_time, 2)}s.')
