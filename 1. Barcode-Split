@@ -14,6 +14,7 @@ nt = 32
 tag = 'CB'  # default TAG is CB
 tag_type = 'Z'  # TAG type is string
 
+##Please set your own absolute path to the following softwares!!##
 samtools = rf'/data/home/lingw/bin/bin/samtools'
 bgzip = rf'/data/home/lingw/bin/bin/bgzip'
 mawk = '/data/home/lingw/anaconda3/bin/mawk'
